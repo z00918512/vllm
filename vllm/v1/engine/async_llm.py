@@ -1067,3 +1067,28 @@ class AsyncLLM(EngineClient):
         await self.collective_rpc(
             "update_weights", kwargs={"update_info": update_info_dict}
         )
+
+    async def update_draft_weights(self, state_dict: dict[str, "torch.Tensor"]) -> None:
+        """Push a newly trained drafter state dict to all workers.
+
+        Intended for use during RL training where the EAGLE/EAGLE3 draft model
+        is fine-tuned online (e.g. via FastRL or ReSpec) and the updated
+        parameters need to be hot-swapped into the running inference engine
+        without restarting it.
+
+        The engine is NOT paused during the copy; each worker performs an
+        atomic in-place copy per parameter, so any in-flight speculative
+        decoding steps will use either the old or the new weights — never a
+        mix within a single parameter.  Callers that require a strict
+        before/after boundary should call ``pause_generation`` first.
+
+        Args:
+            state_dict: Mapping of parameter name → tensor for the trainable
+                draft-model parameters (e.g. the EAGLE decoder layer and
+                ``combine_hidden_states`` projection).  Shared parameters
+                (embeddings, lm_head) are silently skipped by the worker.
+        """
+        items = list(state_dict.items())
+        await self.collective_rpc(
+            "update_draft_weights", kwargs={"state_dict_items": items}
+        )

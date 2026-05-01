@@ -1025,6 +1025,46 @@ class Worker(WorkerBase):
         # Sync here so the next step uses the new weights.
         torch.accelerator.synchronize()
 
+    def update_draft_weights(
+        self, state_dict_items: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        """Update draft model (proposer) parameters in-place.
+
+        Accepts a state dict produced by a HuggingFace EAGLE3 model
+        (parameter names use HF conventions, e.g. ``q_proj`` / ``k_proj`` /
+        ``v_proj`` as separate tensors).  The update is delegated to the inner
+        ``LlamaModel.load_weights()`` which handles:
+
+        * ``midlayer.`` → ``layers.0.`` rename
+        * ``q_proj`` + ``k_proj`` + ``v_proj`` → fused ``qkv_proj`` shards
+        * ``gate_proj`` + ``up_proj``          → fused ``gate_up_proj`` shards
+
+        Weights tied to the target model (``lm_head``, ``embed_tokens``) are
+        skipped — they are kept in sync by the normal target-weight update path.
+
+        Args:
+            state_dict_items: List of ``(name, tensor)`` pairs from the newly
+                trained drafter state dict (HF naming conventions, CPU tensors).
+        """
+        drafter = self.model_runner.drafter
+        if drafter is None or not hasattr(drafter, "model"):
+            raise RuntimeError("No draft model loaded; cannot update draft weights.")
+
+        draft_top = drafter.model  # Eagle3LlamaForCausalLM
+        inner_model = getattr(draft_top, "model", None)  # LlamaModel
+        if inner_model is None or not hasattr(inner_model, "load_weights"):
+            raise RuntimeError(
+                "Draft model does not expose an inner '.model' with "
+                "load_weights(); cannot remap HF weight names to vLLM layout."
+            )
+
+        to_load = _remap_hf_draft_names(state_dict_items, self.device)
+        if to_load:
+            inner_model.load_weights(to_load)
+
+        # load_weights() may be async (e.g. NCCL broadcast path); sync here.
+        torch.accelerator.synchronize()
+
     def shutdown(self) -> None:
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
@@ -1042,6 +1082,30 @@ class Worker(WorkerBase):
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
+
+
+def _remap_hf_draft_names(
+    state_dict_items: list[tuple[str, "torch.Tensor"]],
+    device: "torch.device",
+) -> list[tuple[str, "torch.Tensor"]]:
+    """Strip the ``model.`` prefix from HF parameter names and move tensors to
+    device, preparing them for ``LlamaModel.load_weights()``.
+
+    HuggingFace ``named_parameters()`` on an EAGLE3 model returns names such as
+    ``model.layers.0.self_attn.q_proj.weight``.  ``LlamaModel.load_weights()``
+    expects the same names WITHOUT the ``model.`` prefix.  Weights that do not
+    start with ``model.`` (e.g. ``lm_head.weight``, which is tied to the target
+    model) are intentionally dropped — they are kept in sync by the normal
+    target-weight update path.
+    """
+    to_load = []
+    for name, weight in state_dict_items:
+        if not name.startswith("model."):
+            # Target-shared weights (lm_head, embed_tokens when not prefixed).
+            continue
+        stripped = name[len("model.") :]
+        to_load.append((stripped, weight.to(device)))
+    return to_load
 
 
 def init_worker_distributed_environment(
