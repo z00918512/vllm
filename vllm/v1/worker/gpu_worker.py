@@ -1030,37 +1030,35 @@ class Worker(WorkerBase):
     ) -> None:
         """Update draft model (proposer) parameters in-place.
 
-        Accepts a state dict produced by a HuggingFace EAGLE3 model
-        (parameter names use HF conventions, e.g. ``q_proj`` / ``k_proj`` /
-        ``v_proj`` as separate tensors).  The update is delegated to the inner
-        ``LlamaModel.load_weights()`` which handles:
+        Accepts an AngelSlim-format EAGLE3 state dict (keys preserved as in
+        the original checkpoint: ``fc.weight``, ``midlayer.*``, ``norm.weight``,
+        ``lm_head.weight``).  The update is delegated to the outer
+        ``Eagle3LlamaForCausalLM.load_weights()``, which handles:
 
-        * ``midlayer.`` → ``layers.0.`` rename
-        * ``q_proj`` + ``k_proj`` + ``v_proj`` → fused ``qkv_proj`` shards
-        * ``gate_proj`` + ``up_proj``          → fused ``gate_up_proj`` shards
-
-        Weights tied to the target model (``lm_head``, ``embed_tokens``) are
-        skipped — they are kept in sync by the normal target-weight update path.
+        * prepending ``model.`` for everything except ``lm_head``,
+        * the ``midlayer.`` → ``layers.0.`` rename inside ``LlamaModel``,
+        * stacking ``q/k/v_proj`` → fused ``qkv_proj`` shards,
+        * stacking ``gate/up_proj`` → fused ``gate_up_proj`` shards,
+        * the ``d2t`` → ``draft_id_to_target_id`` rename.
 
         Args:
             state_dict_items: List of ``(name, tensor)`` pairs from the newly
-                trained drafter state dict (HF naming conventions, CPU tensors).
+                trained drafter state dict, CPU tensors with AngelSlim naming.
         """
         drafter = self.model_runner.drafter
         if drafter is None or not hasattr(drafter, "model"):
             raise RuntimeError("No draft model loaded; cannot update draft weights.")
 
         draft_top = drafter.model  # Eagle3LlamaForCausalLM
-        inner_model = getattr(draft_top, "model", None)  # LlamaModel
-        if inner_model is None or not hasattr(inner_model, "load_weights"):
+        if not hasattr(draft_top, "load_weights"):
             raise RuntimeError(
-                "Draft model does not expose an inner '.model' with "
-                "load_weights(); cannot remap HF weight names to vLLM layout."
+                "Draft model does not expose load_weights(); cannot apply "
+                "drafter weight update."
             )
 
-        to_load = _remap_hf_draft_names(state_dict_items, self.device)
+        to_load = [(name, weight.to(self.device)) for name, weight in state_dict_items]
         if to_load:
-            inner_model.load_weights(to_load)
+            draft_top.load_weights(to_load)
 
         # load_weights() may be async (e.g. NCCL broadcast path); sync here.
         torch.accelerator.synchronize()
