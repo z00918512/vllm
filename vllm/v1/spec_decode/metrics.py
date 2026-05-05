@@ -71,6 +71,33 @@ class SpecDecodingLogging:
             spec_decoding_stats.num_accepted_tokens_per_pos
         )
 
+    def snapshot(self, reset: bool = True) -> dict:
+        """Return aggregated spec-decode stats since the last snapshot/log.
+
+        Unlike ``log()``, this returns the stats as a dict for programmatic
+        consumption (e.g. RL trainers reading per-step acceptance rates).
+        When ``reset=True`` the underlying lists are cleared.
+
+        Returns ``{}`` if no draft has been observed since the last reset.
+        """
+        if not self.num_drafts:
+            return {}
+        num_drafts = int(np.sum(self.num_drafts))
+        num_draft_tokens = int(np.sum(self.num_draft_tokens))
+        num_accepted_tokens = int(np.sum(self.num_accepted_tokens))
+        pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
+        per_position_accepted_counts = np.sum(pos_matrix, axis=0).tolist()
+
+        out = {
+            "num_drafts": num_drafts,
+            "num_draft_tokens": num_draft_tokens,
+            "num_accepted_tokens": num_accepted_tokens,
+            "per_position_accepted_counts": per_position_accepted_counts,
+        }
+        if reset:
+            self.reset()
+        return out
+
     def log(self, log_fn=logger.info):
         if not self.num_drafts:
             return

@@ -868,6 +868,65 @@ class AsyncLLM(EngineClient):
         if self.logger_manager:
             self.logger_manager.log()
 
+    async def snapshot_spec_decode_stats(self, reset: bool = True) -> dict:
+        """Return aggregated spec-decode acceptance stats since last snapshot.
+
+        Walks the stat-logger manager and combines per-engine
+        ``SpecDecodingLogging`` instances (raw counts) into a single dict.
+        Useful for RL trainers that want per-step acceptance numbers
+        aligned with their training step boundaries — independent of
+        vLLM's INFO-level log cadence.
+
+        Returns ``{}`` if no draft has been observed since the last reset
+        or if the logger manager has no spec-decode logging configured.
+        """
+        if self.logger_manager is None:
+            return {}
+
+        agg_drafts = 0
+        agg_draft_tokens = 0
+        agg_accepted = 0
+        per_pos: list[int] = []
+
+        def _walk(obj) -> None:
+            nonlocal agg_drafts, agg_draft_tokens, agg_accepted, per_pos
+            sd = getattr(obj, "spec_decoding_logging", None)
+            if sd is not None:
+                snap = sd.snapshot(reset=reset)
+                if snap:
+                    agg_drafts += int(snap["num_drafts"])
+                    agg_draft_tokens += int(snap["num_draft_tokens"])
+                    agg_accepted += int(snap["num_accepted_tokens"])
+                    pp = snap.get("per_position_accepted_counts", [])
+                    if not per_pos:
+                        per_pos = list(pp)
+                    else:
+                        for i, v in enumerate(pp):
+                            if i < len(per_pos):
+                                per_pos[i] += int(v)
+                            else:
+                                per_pos.append(int(v))
+            # Recurse into per-engine adapters which hold inner loggers.
+            for attr in ("per_engine_loggers", "stat_loggers"):
+                inner = getattr(obj, attr, None)
+                if isinstance(inner, dict):
+                    for v in inner.values():
+                        _walk(v)
+                elif isinstance(inner, (list, tuple)):
+                    for v in inner:
+                        _walk(v)
+
+        _walk(self.logger_manager)
+
+        if agg_drafts == 0:
+            return {}
+        return {
+            "num_drafts": agg_drafts,
+            "num_draft_tokens": agg_draft_tokens,
+            "num_accepted_tokens": agg_accepted,
+            "per_position_accepted_counts": per_pos,
+        }
+
     async def check_health(self) -> None:
         logger.debug("Called check_health.")
         if self.errored:
