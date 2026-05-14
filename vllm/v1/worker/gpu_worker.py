@@ -130,6 +130,11 @@ class Worker(WorkerBase):
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
 
+        # CPU-side cache of frozen drafter weights.  Populated on the first
+        # wake_up that loads from disk; subsequent wake_up calls copy from
+        # here instead of re-reading the checkpoint (~ms vs ~80 s on disk).
+        self._drafter_cpu_cache: dict[str, torch.Tensor] | None = None
+
         # Weight transfer engine (initialized on-demand)
         self.weight_transfer_engine = (
             WeightTransferEngineFactory.create_engine(
@@ -191,6 +196,70 @@ class Worker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+
+        # Restore frozen drafter weights after level-2 sleep wipes GPU memory.
+        # First wake_up loads from disk and populates a CPU cache; subsequent
+        # calls copy from the cache (~ms) instead of re-reading the checkpoint
+        # (~80 s on disk), eliminating PCIe contention with concurrent FSDP
+        # AllGather operations in verl colocate mode.
+        if tags is None or "weights" in tags:
+            drafter = getattr(self.model_runner, "drafter", None)
+            drafter_model = getattr(drafter, "model", None)
+            spec_config = self.vllm_config.speculative_config
+            if drafter_model is not None and spec_config is not None:
+                try:
+                    if self._drafter_cpu_cache is not None:
+                        # Fast path: restore from CPU cache.
+                        for name, param in drafter_model.named_parameters():
+                            if name in self._drafter_cpu_cache:
+                                param.data.copy_(self._drafter_cpu_cache[name])
+                        for name, buf in drafter_model.named_buffers():
+                            if name in self._drafter_cpu_cache:
+                                buf.data.copy_(self._drafter_cpu_cache[name])
+                        logger.debug("Restored frozen drafter weights from CPU cache.")
+                    else:
+                        # Slow path: load from disk, then build the CPU cache.
+                        import copy as _copy
+
+                        from vllm.config import set_current_vllm_config
+                        from vllm.model_executor.model_loader import get_model_loader
+
+                        draft_load_config = (
+                            spec_config.draft_load_config
+                            or self.vllm_config.load_config
+                        )
+                        # verl colocate starts with load_format=dummy; override
+                        # to auto so we read real weights from disk.
+                        if getattr(draft_load_config, "load_format", None) == "dummy":
+                            draft_load_config = _copy.copy(draft_load_config)
+                            draft_load_config.load_format = "auto"
+                        model_loader = get_model_loader(draft_load_config)
+                        with set_current_vllm_config(self.vllm_config):
+                            model_loader.load_weights(
+                                drafter_model,
+                                spec_config.draft_model_config,
+                            )
+                        # Populate CPU cache for all subsequent wake_up calls.
+                        self._drafter_cpu_cache = {
+                            name: param.data.cpu().clone()
+                            for name, param in drafter_model.named_parameters()
+                        }
+                        self._drafter_cpu_cache.update(
+                            {
+                                name: buf.data.cpu().clone()
+                                for name, buf in drafter_model.named_buffers()
+                            }
+                        )
+                        logger.info(
+                            "Loaded frozen drafter weights from %s and cached "
+                            "%d tensors in CPU RAM.",
+                            spec_config.draft_model_config.model,
+                            len(self._drafter_cpu_cache),
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to reload drafter weights after wake_up: %s", e
+                    )
 
         # If the KV cache has just been woken up,
         # the internal state of cache_engine must be reset,

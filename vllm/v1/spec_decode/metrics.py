@@ -197,6 +197,26 @@ class SpecDecodingProm:
             for idx, lv in per_engine_labelvalues.items()
         }
 
+    def get_cumulative_stats(self, engine_idx: int = 0) -> dict:
+        """Return current cumulative counter values for per-step delta tracking."""
+        if not self.spec_decoding_enabled:
+            return {}
+        return {
+            "num_drafts": self.counter_spec_decode_num_drafts[engine_idx]._value.get(),
+            "num_draft_tokens": self.counter_spec_decode_num_draft_tokens[
+                engine_idx
+            ]._value.get(),
+            "num_accepted_tokens": self.counter_spec_decode_num_accepted_tokens[
+                engine_idx
+            ]._value.get(),
+            "num_accepted_tokens_per_pos": [
+                c._value.get()
+                for c in self.counter_spec_decode_num_accepted_tokens_per_pos[
+                    engine_idx
+                ]
+            ],
+        }
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return

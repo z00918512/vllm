@@ -4442,21 +4442,16 @@ class GPUModelRunner(
         if not torch.is_tensor(draft_token_ids):
             return
         assert self.draft_token_ids_event is not None
-        assert self.draft_token_ids_copy_stream is not None
         assert self.draft_token_ids_cpu is not None
-        default_stream = torch.cuda.current_stream()
         num_reqs = draft_token_ids.shape[0]
-        with torch.cuda.stream(self.draft_token_ids_copy_stream):
-            if not zeros_only:
-                # Trigger async copy of draft token ids to cpu.
-                self.draft_token_ids_copy_stream.wait_stream(default_stream)
-                self.draft_token_ids_cpu[:num_reqs].copy_(
-                    draft_token_ids, non_blocking=True
-                )
-            else:
-                # No copy needed, just zero-out cpu tensor.
-                self.draft_token_ids_cpu[:num_reqs] = 0
-            self.draft_token_ids_event.record()
+        if not zeros_only:
+            # Synchronous copy on the default stream: avoids a deadlock in
+            # colocate mode where the async DMA on draft_token_ids_copy_stream
+            # never completes when the GPU is shared with FSDP workers.
+            self.draft_token_ids_cpu[:num_reqs].copy_(draft_token_ids)
+        else:
+            self.draft_token_ids_cpu[:num_reqs] = 0
+        self.draft_token_ids_event.record()
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
@@ -4475,16 +4470,15 @@ class GPUModelRunner(
         if self.valid_sampled_token_count_event is None:
             return
 
-        default_stream = torch.cuda.current_stream()
-        # Initialize a new stream to overlap the copy operation with
-        # prepare_input of draft model.
-        with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
-            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
-            counts = valid_sampled_tokens_count
-            counts_cpu = self.valid_sampled_token_count_cpu
-            assert counts_cpu is not None
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
-            self.valid_sampled_token_count_event.record()
+        counts = valid_sampled_tokens_count
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        # Synchronous copy on the default stream: avoids a deadlock in colocate
+        # mode where the async DMA transfer on copy_stream never gets enough PCIe
+        # bandwidth to complete when the GPU is shared with FSDP workers.
+        # The tensor is tiny (~128 int32 values) so the blocking cost is negligible.
+        counts_cpu[: counts.shape[0]].copy_(counts)
+        self.valid_sampled_token_count_event.record()
 
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
